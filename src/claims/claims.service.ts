@@ -10,6 +10,7 @@ import { AuditTrailService } from '../audit/services/audit-trail.service';
 import { AuditActionType, AuditEntityType } from '../audit/entities/audit-log.entity';
 import { AuditLog } from '../audit/decorators/audit-log.decorator';
 
+
 @Injectable()
 export class ClaimsService {
     private readonly logger = new Logger(ClaimsService.name);
@@ -171,5 +172,16 @@ export class ClaimsService {
 
         return updatedClaim;
     }
+     async findOne(id: string): Promise<Claim> {
+    const claim = await this.repo.findOne({
+      where: { id },
+    });
+
+    if (!claim) {
+      throw new NotFoundException(`Claim with id ${id} not found`);
+    }
+
+    return claim;
+  }
 }
 
