@@ -98,9 +98,14 @@ export class EvidenceService {
   /**
    * Get evidence with all versions
    */
-  async getEvidence(evidenceId: string): Promise<Evidence | null> {
+  async getEvidence(evidenceId: string, includeHidden: boolean = false): Promise<Evidence | null> {
+    const where: any = { id: evidenceId };
+    if (!includeHidden) {
+      where.isHidden = false;
+    }
+
     return this.evidenceRepository.findOne({
-      where: { id: evidenceId },
+      where,
       relations: ['versions'],
       order: { versions: { version: 'ASC' } },
     });
@@ -109,8 +114,16 @@ export class EvidenceService {
   /**
    * Get latest version of evidence
    */
-  async getLatestEvidenceVersion(evidenceId: string): Promise<EvidenceVersion | null> {
-    const evidence = await this.evidenceRepository.findOneBy({ id: evidenceId });
+  async getLatestEvidenceVersion(
+    evidenceId: string,
+    includeHidden: boolean = false,
+  ): Promise<EvidenceVersion | null> {
+    const where: any = { id: evidenceId };
+    if (!includeHidden) {
+      where.isHidden = false;
+    }
+
+    const evidence = await this.evidenceRepository.findOneBy(where);
     if (!evidence) {
       return null;
     }
@@ -123,9 +136,14 @@ export class EvidenceService {
   /**
    * Get all evidence for a claim
    */
-  async getEvidenceForClaim(claimId: string): Promise<Evidence[]> {
+  async getEvidenceForClaim(claimId: string, includeHidden: boolean = false): Promise<Evidence[]> {
+    const where: any = { claimId };
+    if (!includeHidden) {
+      where.isHidden = false;
+    }
+
     return this.evidenceRepository.find({
-      where: { claimId },
+      where,
       relations: ['versions'],
       order: { createdAt: 'ASC', versions: { version: 'ASC' } },
     });
@@ -134,8 +152,11 @@ export class EvidenceService {
   /**
    * Get latest evidence version for a claim (assuming one evidence per claim for simplicity)
    */
-  async getLatestEvidenceForClaim(claimId: string): Promise<EvidenceVersion | null> {
-    const evidences = await this.getEvidenceForClaim(claimId);
+  async getLatestEvidenceForClaim(
+    claimId: string,
+    includeHidden: boolean = false,
+  ): Promise<EvidenceVersion | null> {
+    const evidences = await this.getEvidenceForClaim(claimId, includeHidden);
     if (evidences.length === 0) {
       return null;
     }
