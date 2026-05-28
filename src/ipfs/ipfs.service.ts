@@ -41,14 +41,14 @@ export class IpfsService {
    */
   private sanitizeGatewayUrl(urlStr: string): string | undefined {
     try {
+      // Disallow characters commonly used in XSS vectors in the raw provider string
+      const unsafePattern = /[<>\r\n]/;
+      if (unsafePattern.test(urlStr)) return undefined;
+
       const url = new URL(urlStr);
 
       // Only allow http(s)
       if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined;
-
-      // Disallow characters commonly used in XSS vectors
-      const unsafePattern = /[<>\r\n]/;
-      if (unsafePattern.test(url.href)) return undefined;
 
       // Return normalized URL (this will percent-encode parts as needed)
       return url.toString();
