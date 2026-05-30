@@ -3,6 +3,11 @@ import { JwtService } from '@nestjs/jwt';
 import { verifyMessage } from 'ethers';
 import { PrismaService } from '../prisma/prisma.service';
 import { LoginDto } from './dto/login.dto';
+
+export interface NonceRecord {
+  nonce: string;
+  createdAt: number;
+}
 import { RedisService } from '../redis/redis.service';
 
 @Injectable()
