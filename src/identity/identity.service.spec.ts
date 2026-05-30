@@ -1,7 +1,16 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  NotFoundException,
+} from '@nestjs/common';
 import { IdentityService } from './identity.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { AuditTrailService } from '../audit/services/audit-trail.service';
+import {
+  AuditActionType,
+  AuditEntityType,
+} from '../audit/entities/audit-log.entity';
 import { LinkWalletDto } from './dto/link-wallet.dto';
 import { verifyMessage } from 'ethers';
 
@@ -11,7 +20,8 @@ jest.mock('ethers', () => ({
 
 describe('IdentityService', () => {
   let service: IdentityService;
-  let prisma: jest.Mocked<PrismaService>;
+  let prisma: any;
+  let auditTrail: any;
 
   const mockUser = {
     id: 'user-123',
@@ -65,6 +75,7 @@ describe('IdentityService', () => {
               create: jest.fn(),
               findFirst: jest.fn(),
               findUnique: jest.fn(),
+              count: jest.fn(),
               delete: jest.fn(),
             },
             sybilScore: {
@@ -72,11 +83,18 @@ describe('IdentityService', () => {
             },
           },
         },
+        {
+          provide: AuditTrailService,
+          useValue: {
+            log: jest.fn().mockResolvedValue(undefined),
+          },
+        },
       ],
     }).compile();
 
     service = module.get<IdentityService>(IdentityService);
     prisma = module.get(PrismaService);
+    auditTrail = module.get(AuditTrailService);
 
     jest.clearAllMocks();
   });
@@ -110,9 +128,13 @@ describe('IdentityService', () => {
 
     it('should rollback transaction if sybil score creation fails', async () => {
       mockTransaction.user.create.mockResolvedValue(mockUser);
-      mockTransaction.sybilScore.create.mockRejectedValue(new Error('Score creation failed'));
+      mockTransaction.sybilScore.create.mockRejectedValue(
+        new Error('Score creation failed'),
+      );
 
-      await expect(service.createUser()).rejects.toThrow('Score creation failed');
+      await expect(service.createUser()).rejects.toThrow(
+        'Score creation failed',
+      );
     });
   });
 
@@ -284,13 +306,10 @@ describe('IdentityService', () => {
         linkedAt: new Date(),
       };
       prisma.wallet.findUnique.mockResolvedValue(wallet);
+      prisma.wallet.count.mockResolvedValue(2);
       prisma.wallet.delete.mockResolvedValue(wallet);
 
-      const result = await service.unlinkWallet(
-        mockUser.id,
-        '0x123',
-        'ETH',
-      );
+      const result = await service.unlinkWallet(mockUser.id, '0x123', 'ETH');
 
       expect(prisma.wallet.findUnique).toHaveBeenCalledWith({
         where: {
@@ -299,6 +318,14 @@ describe('IdentityService', () => {
             chain: 'ETH',
           },
         },
+      });
+      expect(auditTrail.log).toHaveBeenCalledWith({
+        actionType: AuditActionType.WALLET_UNLINKED,
+        entityType: AuditEntityType.WALLET,
+        entityId: wallet.id,
+        userId: mockUser.id,
+        walletAddress: '0x123',
+        description: 'Wallet unlinked',
       });
       expect(prisma.wallet.delete).toHaveBeenCalledWith({
         where: {

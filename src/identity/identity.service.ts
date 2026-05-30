@@ -2,10 +2,15 @@ import { BadRequestException, Injectable, ConflictException, NotFoundException }
 import { PrismaService } from '../prisma/prisma.service';
 import { LinkWalletDto } from './dto/link-wallet.dto';
 import { verifyMessage } from 'ethers';
+import { AuditTrailService } from '../audit/services/audit-trail.service';
+import { AuditActionType, AuditEntityType } from '../audit/entities/audit-log.entity';
 
 @Injectable()
 export class IdentityService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private auditTrailService: AuditTrailService,
+  ) {}
 
   async createUser() {
     return this.prisma.$transaction(async (tx) => {
@@ -104,11 +109,19 @@ export class IdentityService {
       where: { userId },
     });
 
-    // If we enforce at least one wallet:
     // if (count <= 1) throw new BadRequestException('Cannot unlink the last wallet.');
     // For now, I'll allow unlinking all, as the user might want to delete their identity or switch completely.
     // But I'll leave a comment.
 
+    // Log audit entry for wallet unlink
+    await this.auditTrailService.log({
+      actionType: AuditActionType.WALLET_UNLINKED,
+      entityType: AuditEntityType.WALLET,
+      entityId: wallet.id,
+      userId: userId,
+      walletAddress: address,
+      description: 'Wallet unlinked',
+    });
     return this.prisma.wallet.delete({
       where: {
         address_chain: {
