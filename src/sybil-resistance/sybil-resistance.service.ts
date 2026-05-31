@@ -1,4 +1,5 @@
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 
 /**
@@ -41,9 +42,17 @@ export class SybilResistanceService {
   // Scoring thresholds and normalization constants
   private readonly WALLET_AGE_THRESHOLD_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
   private readonly MIN_STAKING_FOR_FULL_SCORE = BigInt('1000000000000000000'); // 1 token (assuming 18 decimals)
-  private readonly MIN_CLAIMS_FOR_ACCURACY_SCORE = 5;
+  private readonly MIN_CLAIMS_FOR_ACCURACY_SCORE: number;
 
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private configService: ConfigService,
+  ) {
+    this.MIN_CLAIMS_FOR_ACCURACY_SCORE = this.configService.get<number>(
+      'sybil.minClaimsForAccuracyScore',
+      5,
+    );
+  }
 
   /**
    * Compute Sybil resistance score for a user
@@ -86,7 +95,7 @@ export class SybilResistanceService {
    * Gather all signals for a user
    */
   private async gatherSignals(
-    user: { worldcoinVerified?: boolean } | null,
+    user: { id: string, worldcoinVerified?: boolean } | null,
     wallets: Array<{ linkedAt: Date }>,
   ): Promise<SybilSignals> {
 
@@ -96,6 +105,16 @@ export class SybilResistanceService {
           new Date(w.linkedAt) < new Date(oldest.linkedAt) ? w : oldest
         ).linkedAt).getTime()
       : 0;
+
+    // Check for actual verification records (not just the user's boolean, to avoid stale data)
+    let worldcoinVerified = false;
+    if (user) {
+      const verification = await this.prisma.worldIdVerification.findFirst({
+        where: { userId: user.id },
+        orderBy: { verifiedAt: 'desc' },
+      });
+      worldcoinVerified = verification !== null;
+    }
 
     // TODO: Integrate with staking module once available
     // For now, default to 0 total staked amount
@@ -107,7 +126,7 @@ export class SybilResistanceService {
     const claimsCorrect = 0;
 
     return {
-      worldcoinVerified: user?.worldcoinVerified ?? false,
+      worldcoinVerified,
       oldestWalletAgeMs,
       totalStakedAmount,
       claimsVotedOn,
@@ -210,7 +229,12 @@ Final score: ${Number(composite.toFixed(4))} (weighted average)`,
   async recordSybilScore(userId: string): Promise<any> {
     const { score: compositeScore, details } = await this.computeSybilScore(userId);
 
-    return this.prisma.sybilScore.create({
+    // Persist SybilScore without the potentially large `explanation` text
+    const detailsCopy: any = { ...details };
+    const explanationText = detailsCopy.explanation;
+    delete detailsCopy.explanation;
+
+    const scoreRecord = await this.prisma.sybilScore.create({
       data: {
         userId,
         worldcoinScore: details.componentScores.worldcoin,
@@ -218,9 +242,21 @@ Final score: ${Number(composite.toFixed(4))} (weighted average)`,
         stakingScore: details.componentScores.staking,
         accuracyScore: details.componentScores.accuracy,
         compositeScore,
-        calculationDetails: JSON.stringify(details),
+        calculationDetails: JSON.stringify(detailsCopy),
       },
     });
+
+    // Store explanation separately to avoid huge JSON columns
+    if (explanationText) {
+      await this.prisma.sybilExplanation.create({
+        data: {
+          sybilScoreId: scoreRecord.id,
+          explanation: explanationText,
+        },
+      });
+    }
+
+    return scoreRecord;
   }
 
   /**
@@ -350,11 +386,25 @@ Final score: ${Number(composite.toFixed(4))} (weighted average)`,
   }> {
     const score = await this.getLatestSybilScore(userId);
 
+    // Parse calculation details and, if explanation was stored separately, load it
+    let details = score.calculationDetails ? JSON.parse(score.calculationDetails) : null;
+    if (details && !details.explanation) {
+      // try to load explanation from separate table
+      try {
+        const expl = await this.prisma.sybilExplanation.findFirst({ where: { sybilScoreId: score.id } });
+        if (expl && expl.explanation) {
+          details.explanation = expl.explanation;
+        }
+      } catch (err) {
+        // ignore missing explanation
+      }
+    }
+
     return {
       userId,
       score: score.compositeScore,
       isVerified: score.worldcoinScore > 0,
-      details: score.calculationDetails ? JSON.parse(score.calculationDetails) : null,
+      details,
     };
   }
 }

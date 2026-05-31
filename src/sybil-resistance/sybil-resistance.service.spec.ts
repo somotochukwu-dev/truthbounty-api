@@ -1,4 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { ConfigService } from '@nestjs/config';
 import { SybilResistanceService } from './sybil-resistance.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { NotFoundException } from '@nestjs/common';
@@ -6,6 +7,7 @@ import { NotFoundException } from '@nestjs/common';
 describe('SybilResistanceService', () => {
   let service: SybilResistanceService;
   let prisma: any;
+  let configService: ConfigService;
 
   // Mock user data
   const mockUserId = 'test-user-id';
@@ -42,6 +44,19 @@ describe('SybilResistanceService', () => {
               findFirst: jest.fn(),
               findMany: jest.fn(),
             },
+              sybilExplanation: {
+                create: jest.fn(),
+                findFirst: jest.fn(),
+              },
+          },
+        },
+        {
+          provide: ConfigService,
+          useValue: {
+            get: jest.fn((key: string, defaultValue?: any) => {
+              if (key === 'sybil.minClaimsForAccuracyScore') return defaultValue ?? 5;
+              return defaultValue;
+            }),
           },
         },
       ],
@@ -49,6 +64,7 @@ describe('SybilResistanceService', () => {
 
     service = module.get<SybilResistanceService>(SybilResistanceService);
     prisma = module.get<any>(PrismaService);
+    configService = module.get<ConfigService>(ConfigService);
   });
 
   afterEach(() => {
@@ -155,10 +171,14 @@ describe('SybilResistanceService', () => {
       };
 
       jest.spyOn(prisma.sybilScore, 'create').mockResolvedValueOnce(mockScoreRecord);
+      jest.spyOn(prisma.sybilExplanation, 'create').mockResolvedValueOnce({ id: 'ex-1', sybilScoreId: 'score-1', explanation: 'exp' });
 
       const result = await service.recordSybilScore(mockUserId);
 
       expect(prisma.sybilScore.create).toHaveBeenCalled();
+      expect(prisma.sybilExplanation.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ sybilScoreId: 'score-1' }) }),
+      );
       expect(result.userId).toBe(mockUserId);
       expect(result.compositeScore).toBeDefined();
     });
@@ -407,6 +427,29 @@ describe('SybilResistanceService', () => {
       expect(result.details).toBeDefined();
     });
 
+    it('should load explanation from SybilExplanation if not present in calculationDetails', async () => {
+      const mockScore = {
+        id: 'score-1',
+        userId: mockUserId,
+        compositeScore: 0.57,
+        worldcoinScore: 1.0,
+        walletAgeScore: 0.67,
+        stakingScore: 0.0,
+        accuracyScore: 0.0,
+        calculationDetails: JSON.stringify({ componentScores: { worldcoin: 1.0 } }),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      jest.spyOn(prisma.sybilScore, 'findFirst').mockResolvedValueOnce(mockScore);
+      jest.spyOn(prisma.sybilExplanation, 'findFirst').mockResolvedValueOnce({ id: 'ex-1', sybilScoreId: 'score-1', explanation: 'Stored explanation' });
+
+      const result = await service.getSybilScoreForVoting(mockUserId);
+
+      expect(result.details).toBeDefined();
+      expect(result.details.explanation).toBe('Stored explanation');
+    });
+
     it('should indicate unverified status correctly', async () => {
       const mockScore = {
         id: 'score-1',
@@ -471,6 +514,105 @@ describe('SybilResistanceService', () => {
 
       expect(result[0].success).toBe(false);
       expect(result[0].error).toBe('Database error');
+    });
+  });
+
+  describe('MIN_CLAIMS_FOR_ACCURACY_SCORE configurability', () => {
+    async function buildServiceWithMinClaims(minClaims: number): Promise<SybilResistanceService> {
+      const mod = await Test.createTestingModule({
+        providers: [
+          SybilResistanceService,
+          {
+            provide: PrismaService,
+            useValue: {
+              user: { findUnique: jest.fn(), findMany: jest.fn(), update: jest.fn() },
+              sybilScore: { create: jest.fn(), findFirst: jest.fn(), findMany: jest.fn() },
+            },
+          },
+          {
+            provide: ConfigService,
+            useValue: {
+              get: (key: string, defaultValue?: any) =>
+                key === 'sybil.minClaimsForAccuracyScore' ? minClaims : defaultValue,
+            },
+          },
+        ],
+      }).compile();
+      return mod.get<SybilResistanceService>(SybilResistanceService);
+    }
+
+    it('should use the default threshold of 5 when env var is not overridden', () => {
+      // ConfigService mock returns default (5) — accuracy score is 0 for < 5 claims
+      jest.spyOn(prisma.user, 'findUnique').mockResolvedValue({
+        ...mockUser,
+        worldcoinVerified: false,
+        wallets: [],
+      });
+      // Access private field via any cast to verify initialization
+      expect((service as any).MIN_CLAIMS_FOR_ACCURACY_SCORE).toBe(5);
+    });
+
+    it('should read MIN_CLAIMS_FOR_ACCURACY_SCORE from ConfigService on construction', async () => {
+      const customService = await buildServiceWithMinClaims(10);
+      expect((customService as any).MIN_CLAIMS_FOR_ACCURACY_SCORE).toBe(10);
+    });
+
+    it('should not award accuracy score when claims voted on is below configured threshold', async () => {
+      const customService = await buildServiceWithMinClaims(10);
+      const prismaInCustom = (customService as any).prisma;
+
+      // Provide a user whose claimsVotedOn would be below threshold
+      jest.spyOn(prismaInCustom.user, 'findUnique').mockResolvedValue({
+        ...mockUser,
+        wallets: [],
+      });
+
+      const { details } = await customService.computeSybilScore(mockUserId);
+      expect(details.componentScores.accuracy).toBe(0);
+    });
+
+    it('should award accuracy score when claims voted on meets custom threshold', async () => {
+      // Use threshold of 3 and manually inject enough claims via gatherSignals override
+      const customService = await buildServiceWithMinClaims(3);
+      const prismaInCustom = (customService as any).prisma;
+
+      jest.spyOn(prismaInCustom.user, 'findUnique').mockResolvedValue({
+        ...mockUser,
+        wallets: [],
+      });
+
+      // Spy on private gatherSignals to inject 4 correct out of 4 votes (above threshold 3)
+      jest.spyOn(customService as any, 'gatherSignals').mockResolvedValue({
+        worldcoinVerified: false,
+        oldestWalletAgeMs: 0,
+        totalStakedAmount: BigInt(0),
+        claimsVotedOn: 4,
+        claimsCorrect: 4,
+      });
+
+      const { details } = await customService.computeSybilScore(mockUserId);
+      expect(details.componentScores.accuracy).toBe(1);
+    });
+
+    it('should treat boundary value (exactly equal to threshold) as meeting the threshold', async () => {
+      const customService = await buildServiceWithMinClaims(3);
+      const prismaInCustom = (customService as any).prisma;
+
+      jest.spyOn(prismaInCustom.user, 'findUnique').mockResolvedValue({
+        ...mockUser,
+        wallets: [],
+      });
+
+      jest.spyOn(customService as any, 'gatherSignals').mockResolvedValue({
+        worldcoinVerified: false,
+        oldestWalletAgeMs: 0,
+        totalStakedAmount: BigInt(0),
+        claimsVotedOn: 3, // exactly at threshold
+        claimsCorrect: 3,
+      });
+
+      const { details } = await customService.computeSybilScore(mockUserId);
+      expect(details.componentScores.accuracy).toBe(1);
     });
   });
 

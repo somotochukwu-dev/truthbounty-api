@@ -2,14 +2,29 @@ import { BadRequestException, Injectable, ConflictException, NotFoundException }
 import { PrismaService } from '../prisma/prisma.service';
 import { LinkWalletDto } from './dto/link-wallet.dto';
 import { verifyMessage } from 'ethers';
+import { AuditTrailService } from '../audit/services/audit-trail.service';
+import { AuditActionType, AuditEntityType } from '../audit/entities/audit-log.entity';
 
 @Injectable()
 export class IdentityService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private auditTrailService: AuditTrailService,
+  ) {}
 
   async createUser() {
-    return this.prisma.user.create({
-      data: {},
+    return this.prisma.$transaction(async (tx) => {
+      const user = await tx.user.create({
+        data: {},
+      });
+
+      await tx.sybilScore.create({
+        data: {
+          userId: user.id,
+        },
+      });
+
+      return user;
     });
   }
 
@@ -25,7 +40,7 @@ export class IdentityService {
   async linkWallet(userId: string, dto: LinkWalletDto) {
     const { address, chain, signature, message } = dto;
 
-    // 1. Verify Signature
+    // 1. Verify Signature (outside transaction - pure computation)
     let recoveredAddress: string;
     try {
       recoveredAddress = verifyMessage(message, signature);
@@ -37,47 +52,35 @@ export class IdentityService {
       throw new BadRequestException('Signature verification failed. Address mismatch.');
     }
 
-    // 2. Check if wallet is already linked
-    // We check if this address is linked on ANY chain to ANY user?
-    // "No wallet mapped to multiple users".
-    // "Prevent wallet reuse across users".
-    // If 0x123 is linked to User A on ETH, can User B link 0x123 on POLYGON?
-    // No, because 0x123 is the same identity key.
-    // So we should check if `address` exists in DB for a different userId.
-    
-    const existingWallet = await this.prisma.wallet.findFirst({
-      where: {
-        address: address, // Check global uniqueness of address ownership
-      },
-    });
+    // 2-4. Transactional check-and-create to prevent race conditions
+    return this.prisma.$transaction(async (tx) => {
+      // Check if wallet is already linked
+      const existingWallet = await tx.wallet.findFirst({
+        where: {
+          address: address,
+        },
+      });
 
-    if (existingWallet) {
-      if (existingWallet.userId !== userId) {
-        throw new ConflictException('Wallet is already linked to another user.');
+      if (existingWallet) {
+        if (existingWallet.userId !== userId) {
+          throw new ConflictException('Wallet is already linked to another user.');
+        }
+        if (existingWallet.chain === chain) {
+           return existingWallet;
+        }
       }
-      // If linked to same user, check chain
-      // If exact match (address + chain), it's already done.
-      if (existingWallet.chain === chain) {
-         return existingWallet; // Already linked
-      }
-      // Same user, different chain.
-      // We allow this.
-    }
 
-    // 3. Check if exact (address, chain) tuple exists (should be covered by above logic mostly, but let's be safe)
-    // The @unique([address, chain]) in schema will throw if we try to create duplicate.
+      // Ensure user exists
+      const user = await tx.user.findUnique({ where: { id: userId } });
+      if (!user) throw new NotFoundException('User not found');
 
-    // 4. Link it
-    // Ensure user exists
-    const user = await this.prisma.user.findUnique({ where: { id: userId } });
-    if (!user) throw new NotFoundException('User not found');
-
-    return this.prisma.wallet.create({
-      data: {
-        address,
-        chain,
-        userId,
-      },
+      return tx.wallet.create({
+        data: {
+          address,
+          chain,
+          userId,
+        },
+      });
     });
   }
 
@@ -106,11 +109,19 @@ export class IdentityService {
       where: { userId },
     });
 
-    // If we enforce at least one wallet:
     // if (count <= 1) throw new BadRequestException('Cannot unlink the last wallet.');
     // For now, I'll allow unlinking all, as the user might want to delete their identity or switch completely.
     // But I'll leave a comment.
 
+    // Log audit entry for wallet unlink
+    await this.auditTrailService.log({
+      actionType: AuditActionType.WALLET_UNLINKED,
+      entityType: AuditEntityType.WALLET,
+      entityId: wallet.id,
+      userId: userId,
+      walletAddress: address,
+      description: 'Wallet unlinked',
+    });
     return this.prisma.wallet.delete({
       where: {
         address_chain: {
